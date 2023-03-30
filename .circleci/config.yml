@@ -22,7 +22,7 @@ jobs:
 #              awscli==1.11.76
       - run:
           name: ls
-          command: ls && cat /usr/src/entrypoint -al && pwd
+          command: ls && cat /usr/src/entrypoint && pwd
       - run:
            name: ls2
            command: ls -alr /usr/src/*
