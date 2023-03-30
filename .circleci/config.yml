@@ -6,7 +6,7 @@ version: 2.1
 # See: https://circleci.com/docs/configuration-reference/#jobs
 jobs:
   build:
-    working_directory: /
+#    working_directory: /
     docker:
 #      - image: instructure/canvas-lms:master
       - image: cimg/base:stable
