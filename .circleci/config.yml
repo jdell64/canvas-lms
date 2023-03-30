@@ -20,6 +20,9 @@ jobs:
 #            pip install \
 #              docker-compose==1.12.0 \
 #              awscli==1.11.76
+      - run:
+          name: ls
+          command: ls -al && pwd
       - restore_cache:
           keys:
             - v1-{{ .Branch }}
