@@ -22,8 +22,12 @@ jobs:
 #              awscli==1.11.76
       - run:
           name: ls
-          command: ls && ls /usr/src/ -al && pwd
-#      - restore_cache:
+          command: ls && ls /usr/src/entrypoint -al && pwd
+      - run:
+           name: ls2
+           command: ls -alr /usr/src/*
+
+  #      - restore_cache:
 #          keys:
 #            - v1-{{ .Branch }}
 #          paths:
