@@ -26,6 +26,10 @@ jobs:
       - run:
            name: ls2
            command: ls -alr /usr/src/*
+      - run:
+          name: entrypoint
+          command: sh /usr/src/entrypoint
+
 
   #      - restore_cache:
 #          keys:
