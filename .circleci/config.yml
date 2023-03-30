@@ -10,7 +10,7 @@ jobs:
     docker:
       - image: instructure/canvas-lms:master
     steps:
-      - checkout
+#      - checkout
       - setup_remote_docker
       - run:
           name: Install dependencies
