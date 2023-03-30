@@ -1,89 +1,367 @@
-# Use the latest 2.1 version of CircleCI pipeline process engine.
-# See: https://circleci.com/docs/configuration-reference
 version: 2.1
-
-# Define a job to be invoked later in a workflow.
-# See: https://circleci.com/docs/configuration-reference/#jobs
 jobs:
-  build:
-    working_directory: /
+  environment:
     docker:
-      - image: instructure/canvas-lms:master
+      - image: 'cimg/base:2023.03'
     steps:
-#      - checkout
-#      - setup_remote_docker
-#      - run:
-#          name: Install dependencies
-#          command: |
-#            apk add --no-cache \
-#              py-pip=9.0.0-r1
-#            pip install \
-#              docker-compose==1.12.0 \
-#              awscli==1.11.76
       - run:
-          name: ls
-          command: ls && cat /usr/src/entrypoint && pwd
-      - run:
-           name: ls2
-           command: ls -alr /usr/src/*
-      - run:
-          name: entrypoint
-          command: sh /usr/src/entrypoint
+          name: Consider re-writing as a CircleCI run step
+          command: exit 1
+          JFC_STACK_TRACE: |-
+            Please refer to environment variable documentation for more informationhttps://circleci.com/docs/2.0/configuration-reference/#runscript lock(label: 'canvas_build_global_mutex', quantity: 1) {
+                        timeout(60) {
+                          // Skip translation builds for patchsets uploaded by svc.cloudjenkins
+                          if (env.GERRIT_PATCHSET_UPLOADER_EMAIL == 'svc.cloudjenkins@instructure.com' && env.GERRIT_CHANGE_SUBJECT =~ /translation$/) {
+                            // Set status to NOT_BUILT for pre-merge builds
+                            if (!configuration.isChangeMerged()) {
+                              currentBuild.result = 'NOT_BUILT'
+                            }
+                            return
+                          }
 
+                          node('master') {
+                            // For builds like Rails 6.1 prototype, we want to be able to see the build link, but
+                            // not have Gerrit vote on it. This isn't currently supported through the Gerrit Trigger
+                            // plugin, because the Build Started message always votes and will clear the original
+                            // vote. Work around this by disabling the build start message and setting EMULATE_BUILD_START=1
+                            // in the Build Parameters section.
+                            // https://issues.jenkins.io/browse/JENKINS-28339
+                            if (commitMessageFlag("emulate-build-start") as Boolean) {
+                              submitGerritReview("", "Build Started ${RUN_DISPLAY_URL}")
+                            }
 
-  #      - restore_cache:
-#          keys:
-#            - v1-{{ .Branch }}
-#          paths:
-#            - /caches/app.tar
-#      - run:
-#          name: Load Docker image layer cache
-#          command: |
-#            set +o pipefail
-#            docker load -i /caches/app.tar | true
-#      - run:
-#          name: Build application Docker image
-#          command: |
-#            docker build --cache-from=app -t app .
-#      - run:
-#          name: Save Docker image layer cache
-#          command: |
-#            mkdir -p /caches
-#            docker save -o /caches/app.tar app
-#      - save_cache:
-#          key: v1-{{ .Branch }}-{{ epoch }}
-#          paths:
-#            - /caches/app.tar
-#      - run:
-#          name: Run tests
-#          command: |
-#            docker-compose -f ./docker-compose.test.yml up
-#      - deploy:
-#          name: Push application Docker image
-#          command: |
-#            if [ "${CIRCLE_BRANCH}" == "master" ]; then
-#              login="$(aws ecr get-login)"
-#              ${login}
-#              docker tag app "${ECR_ENDPOINT}/app:${CIRCLE_SHA1}"
-#              docker push "${ECR_ENDPOINT}/app:${CIRCLE_SHA1}"
-#            fi
+                            if (commitMessageFlag("skip-ci") as Boolean) {
+                              currentBuild.result = 'NOT_BUILT'
+                              submitGerritReview('--label Lint-Review=-2', 'Build not executed due to [skip-ci] flag')
+                              error '[skip-ci] flag enabled: skipping the build'
+                              return
+                            } else if (extendedStage.isAllowStagesFilterUsed() || extendedStage.isIgnoreStageResultsFilterUsed() || extendedStage.isSkipStagesFilterUsed()) {
+                              submitGerritReview('--label Lint-Review=-2', 'One or more build flags causes a subset of the build to be run')
+                            } else if (setupStage.hasGemOverrides()) {
+                              submitGerritReview('--label Lint-Review=-2', 'One or more build flags causes the build to be run against an unmerged gem version override')
+                            } else {
+                              submitGerritReview('--label Lint-Review=0')
+                            }
+                          }
 
-  say-hello:
-    # Specify the execution environment. You can specify an image from Docker Hub or use one of our convenience images from CircleCI's Developer Hub.
-    # See: https://circleci.com/docs/configuration-reference/#executor-job
-    docker:
-      - image: cimg/base:stable
-    # Add steps to the job
-    # See: https://circleci.com/docs/configuration-reference/#steps
-    steps:
-      - checkout
-      - run:
-          name: "Say hello"
-          command: "echo Hello, World!"
+                          if (isStartedByUser()) {
+                            env.GERRIT_PATCHSET_REVISION = git.getRevisionHash()
+                            buildParameters += string(name: 'GERRIT_PATCHSET_REVISION', value: "${env.GERRIT_PATCHSET_REVISION}")
+                          }
 
-# Orchestrate jobs using workflows
-# See: https://circleci.com/docs/configuration-reference/#workflows
+                          // Ensure that all build flags are compatible.
+                          if (commitMessageFlag('change-merged') as Boolean && configuration.buildRegistryPath() == configuration.buildRegistryPathDefault()) {
+                            error 'Manually triggering the change-merged build path must be combined with a custom build-registry-path'
+                            return
+                          }
+
+                          maybeSlackSendRetrigger()
+
+                          def postBuildHandler = [
+                            onStageEnded: { stageName, stageConfig, result ->
+                              buildSummaryReport.addFailureRun('Main Build', currentBuild)
+                              postFn(stageConfig.status())
+                            }
+                          ]
+
+                          extendedStage('Root').hooks(postBuildHandler).obeysAllowStages(false).reportTimings(false).execute {
+                            def rootStages = [:]
+
+                            buildParameters += string(name: 'CANVAS_BUILDS_REFSPEC', value: "${env.CANVAS_BUILDS_REFSPEC}")
+                            buildParameters += string(name: 'PATCHSET_TAG', value: "${env.PATCHSET_TAG}")
+                            buildParameters += string(name: 'POSTGRES', value: "${env.POSTGRES}")
+                            buildParameters += string(name: 'RUBY', value: "${env.RUBY}")
+                            buildParameters += string(name: 'CANVAS_RAILS', value: "${env.CANVAS_RAILS}")
+
+                            // If modifying any of our Jenkinsfiles set JENKINSFILE_REFSPEC for sub-builds to use Jenkinsfiles in
+                            // the gerrit rather than master. Stable branches also need to check out the JENKINSFILE_REFSPEC to prevent
+                            // the job default from pulling master.
+                            if (env.GERRIT_PROJECT == 'canvas-lms' && env.JOB_NAME.endsWith('Jenkinsfile')) {
+                              buildParameters += string(name: 'JENKINSFILE_REFSPEC', value: "${env.GERRIT_REFSPEC}")
+                            } else if (env.GERRIT_PROJECT == 'canvas-lms' && env.JOB_NAME.endsWith('stable')) {
+                              buildParameters += string(name: 'JENKINSFILE_REFSPEC', value: "${env.GERRIT_REFSPEC}")
+                            }
+
+                            if (env.GERRIT_PROJECT != 'canvas-lms') {
+                              // the plugin builds require the canvas lms refspec to be different. so only
+                              // set this refspec if the main build is requesting it to be set.
+                              // NOTE: this is only being set in main-from-plugin build. so main-canvas wont run this.
+                              buildParameters += string(name: 'CANVAS_LMS_REFSPEC', value: env.CANVAS_LMS_REFSPEC)
+                            }
+
+                            extendedStage('Builder').nodeRequirements(label: nodeLabel(), podTemplate: null).obeysAllowStages(false).reportTimings(false).queue(rootStages) {
+                              extendedStage('Setup')
+                                .hooks(buildSummaryReportHooks.call())
+                                .obeysAllowStages(false)
+                                .timeout(2)
+                                .execute {
+                                  buildDockerImageStage.preloadCacheImagesAsync()
+                                  setupStage()
+                                }
+
+                              extendedStage('Rebase')
+                                .hooks(buildSummaryReportHooks.call())
+                                .obeysAllowStages(false)
+                                .required(!configuration.isChangeMerged() && env.GERRIT_PROJECT == 'canvas-lms')
+                                .timeout(2)
+                                .execute { rebaseStage() }
+
+                              extendedStage(filesChangedStage.STAGE_NAME)
+                                .hooks(buildSummaryReportHooks.call())
+                                .obeysAllowStages(false)
+                                .timeout(2)
+                                .execute(filesChangedStage.&preBuild)
+
+                              extendedStage('Build Docker Image (Pre-Merge)')
+                                .hooks(buildSummaryReportHooks.call())
+                                .obeysAllowStages(false)
+                                .required(configuration.isChangeMerged())
+                                .timeout(20)
+                                .execute(buildDockerImageStage.&premergeCacheImage)
+
+                              extendedStage(BUILD_DOCKER_IMAGE_STAGE)
+                                .hooks(buildSummaryReportHooks.call())
+                                .obeysAllowStages(false)
+                                .timeout(20)
+                                .execute {
+                                  def startStep = '''
+                                    docker run -dt --name general-build-container --volume $(pwd)/$LOCAL_WORKDIR/.git:$DOCKER_WORKDIR/.git -e RAILS_ENV=test $PATCHSET_TAG bash -c "sleep infinity"
+                                    docker exec -dt general-build-container bin/rails graphql:schema
+                                  '''
+
+                                  def crystalballStep = '''
+                                    diffFrom=$(git --git-dir $LOCAL_WORKDIR/.git rev-parse $GERRIT_PATCHSET_REVISION^1)
+                                    docker exec -dt \
+                                                    -e CRYSTALBALL_DIFF_FROM=$diffFrom \
+                                                    -e CRYSTALBALL_DIFF_TO=$GERRIT_PATCHSET_REVISION \
+                                                    -e CRYSTALBALL_REPO_PATH=$DOCKER_WORKDIR \
+                                                    -e FORCE_CRYSTALBALL=$FORCE_CRYSTALBALL \
+                                                    general-build-container bundle exec crystalball --dry-run
+                                  '''
+
+                                  def finalStep = '''
+                                    docker exec -t general-build-container ps aww
+                                  '''
+
+                                  def asyncSteps = [
+                                    startStep,
+                                    !configuration.isChangeMerged() && env.GERRIT_REFSPEC != 'refs/heads/master' ? crystalballStep : '',
+                                    finalStep
+                                  ]
+
+                                  buildDockerImageStage.patchsetImage(asyncSteps.join("\n"))
+                                }
+
+                              extendedStage(filesChangedStage.STAGE_NAME_POST_BUILD)
+                                .hooks(buildSummaryReportHooks.call())
+                                .obeysAllowStages(false)
+                                .timeout(2)
+                                .execute(filesChangedStage.&postBuild)
+
+                              extendedStage(RUN_MIGRATIONS_STAGE)
+                                .hooks(buildSummaryReportHooks.call())
+                                .obeysAllowStages(false)
+                                .timeout(10)
+                                .execute { runMigrationsStage() }
+
+                              extendedStage('Generate Crystalball Prediction')
+                                .hooks(buildSummaryReportHooks.call())
+                                .obeysAllowStages(false)
+                                .required(!configuration.isChangeMerged() && env.GERRIT_REFSPEC != "refs/heads/master")
+                                .timeout(2)
+                                .execute {
+                                  try {
+                                    /* groovylint-disable-next-line GStringExpressionWithinString */
+                                    sh '''#!/bin/bash
+                                      set -ex
+
+                                      while docker exec -t general-build-container ps aww | grep crystalball; do
+                                        sleep 0.1
+                                      done
+
+                                      docker cp \$(docker ps -qa -f name=general-build-container):/usr/src/app/crystalball_spec_list.txt ./tmp/crystalball_spec_list.txt
+                                    '''
+                                    archiveArtifacts allowEmptyArchive: true, artifacts: 'tmp/crystalball_spec_list.txt'
+
+                                    sh 'grep ":timestamp:" crystalball_map.yml | sed "s/:timestamp: //g" > ./tmp/crystalball_map_version.txt'
+                                    archiveArtifacts allowEmptyArchive: true, artifacts: 'tmp/crystalball_map_version.txt'
+                                  /* groovylint-disable-next-line CatchException */
+                                  } catch (Exception e) {
+                                    // default to full run of specs
+                                    sh 'echo -n "." > tmp/crystalball_spec_list.txt'
+                                    sh 'echo -n "broken map, defaulting to run all tests" > tmp/crystalball_map_version.txt'
+
+                                    archiveArtifacts allowEmptyArchive: true, artifacts: 'tmp/crystalball_spec_list.txt, tmp/crystalball_map_version.txt'
+
+                                    slackSend(
+                                      channel: '#crystalball-noisy',
+                                      color: 'danger',
+                                      message: "${env.JOB_NAME} <${getSummaryUrl()}|#${env.BUILD_NUMBER}>\n\nFailed to generate prediction!"
+                                    )
+                                  }
+                                }
+
+                              extendedStage('Locales Only Changes')
+                                .hooks(buildSummaryReportHooks.call())
+                                .obeysAllowStages(false)
+                                .required(!configuration.isChangeMerged() && env.GERRIT_PROJECT == 'canvas-lms' && sh(script: "${WORKSPACE}/build/new-jenkins/locales-changes.sh", returnStatus: true) == 0)
+                                .execute {
+                                    submitGerritReview('--label Lint-Review=-2', 'This commit contains only changes to config/locales/, this could be a bad sign!')
+                                  }
+
+                              extendedStage('Webpack Bundle Size Check')
+                                .hooks(buildSummaryReportHooks.call())
+                                .obeysAllowStages(false)
+                                .required(configuration.isChangeMerged())
+                                .timeout(20)
+                                .execute { webpackStage.&calcBundleSizes() }
+
+                              extendedStage('Parallel Run Tests').obeysAllowStages(false).execute { stageConfig, buildConfig ->
+                                def stages = [:]
+
+                                extendedStage('Consumer Smoke Test').hooks(buildSummaryReportHooks.call()).queue(stages) {
+                                  sh 'build/new-jenkins/consumer-smoke-test.sh'
+                                }
+
+                                def shouldRunJS = configuration.isChangeMerged() || commitMessageFlag('force-failure-js') as Boolean ||
+                                  (!configuration.isChangeMerged() && (filesChangedStage.hasGraphqlFiles(buildConfig) || filesChangedStage.hasJsFiles(buildConfig)))
+
+                                extendedStage(JS_BUILD_IMAGE_STAGE)
+                                  .hooks(buildSummaryReportHooks.call())
+                                  .required(shouldRunJS)
+                                  .queue(stages, buildDockerImageStage.&jsImage)
+
+                                extendedStage(LINTERS_BUILD_IMAGE_STAGE)
+                                  .hooks(buildSummaryReportHooks.call())
+                                  .queue(stages, buildDockerImageStage.&lintersImage)
+
+                                extendedStage('Run i18n:extract')
+                                  .hooks(buildSummaryReportHooks.call())
+                                  .required(configuration.isChangeMerged())
+                                  .queue(stages, buildDockerImageStage.&i18nExtract)
+
+                                parallel(stages)
+                              }
+                            }
+
+                            extendedStage('ARM64 Builder - Container')
+                              .hooks(buildSummaryReportHooks.call())
+                              .nodeRequirements(label: 'docker-arm64')
+                              .required(configuration.isChangeMerged())
+                              .queue(rootStages) {
+                                extendedStage('ARM64 Builder').execute {
+                                  setupStage()
+                                  // Rebase is fortunately not needed - since this only runs in post-merge
+                                  buildDockerImageStage.patchsetImage('', '-arm64')
+                                }
+
+                                extendedStage('Augment Manifest').waitsFor(BUILD_DOCKER_IMAGE_STAGE, 'Builder').execute {
+                                  sh """#!/bin/bash -ex
+                                  docker manifest create --amend $PATCHSET_TAG $PATCHSET_TAG $PATCHSET_TAG-arm64
+                                  docker manifest push $PATCHSET_TAG
+                                  """
+                                }
+                              }
+
+                            extendedStage("${filesChangedStage.STAGE_NAME} (Waiting for Dependencies)").obeysAllowStages(false).waitsFor(filesChangedStage.STAGE_NAME, 'Builder').queue(rootStages) { stageConfig, buildConfig ->
+                              def nestedStages = [:]
+
+                              extendedStage('Local Docker Dev Build')
+                                .hooks(buildSummaryReportHooks.call())
+                                .required(env.GERRIT_PROJECT == 'canvas-lms' && filesChangedStage.hasDockerDevFiles(buildConfig))
+                                .queue(nestedStages, jobName: '/Canvas/test-suites/local-docker-dev-smoke', buildParameters: buildParameters)
+
+                              parallel(nestedStages)
+                            }
+
+                            extendedStage('Javascript (Waiting for Dependencies)').obeysAllowStages(false).waitsFor(JS_BUILD_IMAGE_STAGE, 'Builder').queue(rootStages) {
+                              def nestedStages = [:]
+
+                              extendedStage('Javascript')
+                                .hooks(buildSummaryReportHooks.withRunManifest(true))
+                                .queue(nestedStages, jobName: '/Canvas/test-suites/JS', buildParameters: buildParameters + [
+                                  string(name: 'KARMA_RUNNER_IMAGE', value: env.KARMA_RUNNER_IMAGE),
+                                ])
+
+                              parallel(nestedStages)
+                            }
+
+                            extendedStage('Linters (Waiting for Dependencies)').obeysAllowStages(false).waitsFor(LINTERS_BUILD_IMAGE_STAGE, 'Builder').queue(rootStages) { stageConfig, buildConfig ->
+                              extendedStage('Linters - Dependency Check')
+                                .nodeRequirements(label: nodeLabel(), podTemplate: dependencyCheckStage.nodeRequirementsTemplate(), container: 'dependency-check')
+                                .required(configuration.isChangeMerged())
+                                .execute(dependencyCheckStage.queueTestStage())
+
+                              extendedStage('Linters')
+                                .hooks([onNodeReleasing: lintersStage.tearDownNode()])
+                                .nodeRequirements(label: nodeLabel(), podTemplate: lintersStage.nodeRequirementsTemplate())
+                                .required(!configuration.isChangeMerged() && env.GERRIT_CHANGE_ID != '0')
+                                .execute {
+                                  def nestedStages = [:]
+
+                                  callableWithDelegate(lintersStage.bundleStage(nestedStages, buildConfig))()
+                                  callableWithDelegate(lintersStage.codeStage(nestedStages))()
+                                  callableWithDelegate(lintersStage.groovyStage(nestedStages, buildConfig))()
+                                  callableWithDelegate(lintersStage.masterBouncerStage(nestedStages))()
+                                  callableWithDelegate(lintersStage.yarnStage(nestedStages, buildConfig))()
+
+                                  parallel(nestedStages)
+                                }
+                            }
+
+                            extendedStage("${RUN_MIGRATIONS_STAGE} (Waiting for Dependencies)").obeysAllowStages(false).waitsFor(RUN_MIGRATIONS_STAGE, 'Builder').queue(rootStages) { stageConfig, buildConfig ->
+                              def nestedStages = [:]
+
+                              extendedStage('Contract Tests')
+                                .hooks(buildSummaryReportHooks.call())
+                                .queue(nestedStages, jobName: '/Canvas/test-suites/contract-tests', buildParameters: buildParameters + [
+                                  string(name: 'CASSANDRA_IMAGE_TAG', value: "${env.CASSANDRA_IMAGE_TAG}"),
+                                  string(name: 'DYNAMODB_IMAGE_TAG', value: "${env.DYNAMODB_IMAGE_TAG}"),
+                                  string(name: 'POSTGRES_IMAGE_TAG', value: "${env.POSTGRES_IMAGE_TAG}"),
+                                ])
+
+                              // Trigger Crystalball map build if spec files were added or removed, will not vote on builds.
+                              if (configuration.isChangeMerged() && filesChangedStage.hasNewDeletedSpecFiles(buildConfig)) {
+                                build(wait: false, job: 'Canvas/helpers/crystalball-map')
+                              }
+
+                              extendedStage('Flakey Spec Catcher')
+                                .hooks(buildSummaryReportHooks.call())
+                                .required(!configuration.isChangeMerged() && filesChangedStage.hasSpecFiles(buildConfig) || commitMessageFlag('force-failure-fsc') as Boolean)
+                                .queue(nestedStages, jobName: '/Canvas/test-suites/flakey-spec-catcher', buildParameters: buildParameters + [
+                                  string(name: 'CASSANDRA_IMAGE_TAG', value: "${env.CASSANDRA_IMAGE_TAG}"),
+                                  string(name: 'DYNAMODB_IMAGE_TAG', value: "${env.DYNAMODB_IMAGE_TAG}"),
+                                  string(name: 'POSTGRES_IMAGE_TAG', value: "${env.POSTGRES_IMAGE_TAG}"),
+                                ])
+
+                              extendedStage('Vendored Gems')
+                                .hooks(buildSummaryReportHooks.call())
+                                .queue(nestedStages, jobName: '/Canvas/test-suites/vendored-gems', buildParameters: buildParameters + [
+                                  string(name: 'CASSANDRA_IMAGE_TAG', value: "${env.CASSANDRA_IMAGE_TAG}"),
+                                  string(name: 'DYNAMODB_IMAGE_TAG', value: "${env.DYNAMODB_IMAGE_TAG}"),
+                                  string(name: 'POSTGRES_IMAGE_TAG', value: "${env.POSTGRES_IMAGE_TAG}"),
+                                ])
+
+                              extendedStage('RspecQ Tests')
+                                .hooks(buildSummaryReportHooks.withRunManifest())
+                                .queue(nestedStages, jobName: '/Canvas/test-suites/test-queue', buildParameters: buildParameters + [
+                                  string(name: 'CASSANDRA_IMAGE_TAG', value: "${env.CASSANDRA_IMAGE_TAG}"),
+                                  string(name: 'DYNAMODB_IMAGE_TAG', value: "${env.DYNAMODB_IMAGE_TAG}"),
+                                  string(name: 'POSTGRES_IMAGE_TAG', value: "${env.POSTGRES_IMAGE_TAG}"),
+                                  string(name: 'SKIP_CRYSTALBALL', value: "${env.SKIP_CRYSTALBALL || setupStage.hasGemOverrides()}"),
+                                  string(name: 'UPSTREAM_TAG', value: "${env.BUILD_TAG}"),
+                                  string(name: 'UPSTREAM', value: "${env.JOB_NAME}"),
+                                ])
+
+                              parallel(nestedStages)
+                            }
+
+                            parallel(rootStages)
+                          }
+                        }
+                      }
 workflows:
-  say-hello-workflow:
+  version: 2
+  build-and-test:
     jobs:
-      - build
+      - environment
