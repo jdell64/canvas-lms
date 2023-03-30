@@ -8,7 +8,7 @@ jobs:
   build:
     working_directory: /
     docker:
-      - image: instructure/canvas-lms
+      - image: instructure/canvas-lms:master
     steps:
       - checkout
       - setup_remote_docker
