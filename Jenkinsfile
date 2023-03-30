@@ -233,7 +233,7 @@ def getCanvasLmsRefspec() {
 pipeline {
   agent none
   options {
-
+    ansiColor('xterm')
     timeout(time: 8, unit: 'HOURS')
     timestamps()
   }
