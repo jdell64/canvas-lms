@@ -22,7 +22,7 @@ jobs:
 #              awscli==1.11.76
       - run:
           name: ls
-          command: ls && ls /opt -al && pwd
+          command: ls && ls /usr/src/ -al && pwd
 #      - restore_cache:
 #          keys:
 #            - v1-{{ .Branch }}
